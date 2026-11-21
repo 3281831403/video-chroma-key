@@ -20,6 +20,8 @@ inside this module.
 
 from __future__ import annotations
 
+import math
+
 __all__ = [
     "KeyError",
     "alpha_for",
@@ -40,6 +42,64 @@ class KeyError(ValueError):
     """Raised for an invalid pixel, key, parameter, matte, or frame."""
 
 
+_TOL = 1e-6
+_BLACK = (0.0, 0.0, 0.0)
+
+
+def _is_finite(value: object) -> bool:
+    """Return ``True`` only for a real, finite scalar."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _components(value: object) -> tuple[float, float, float]:
+    """Return the three float components of a finite RGB triple.
+
+    Raises :class:`KeyError` for a non-tuple, wrong arity, non-finite
+    component, or a component outside ``[0.0, 1.0]``.
+    """
+    if not isinstance(value, (tuple, list)) or len(value) != 3:
+        raise KeyError(f"expected a 3-component RGB pixel, got {value!r}")
+    for component in value:
+        if not _is_finite(component):
+            raise KeyError(f"pixel component must be finite, got {component!r}")
+        if component < 0.0 or component > 1.0:
+            raise KeyError(f"pixel component must be in [0.0, 1.0], got {component!r}")
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def _validated_key(key: object) -> tuple[float, float, float]:
+    """Validate a key colour, rejecting an exactly black key."""
+    validated = _components(key)
+    if all(abs(component) <= _TOL for component in validated):
+        raise KeyError("key colour must not be black")
+    return validated
+
+
+def _validated_params(similarity: object, smoothness: object) -> tuple[float, float]:
+    """Validate the two alpha-ramp parameters and their ordering."""
+    for name, value in (("similarity", similarity), ("smoothness", smoothness)):
+        if not _is_finite(value):
+            raise KeyError(f"{name} must be a finite number, got {value!r}")
+        if value < 0.0 or value > 1.0:
+            raise KeyError(f"{name} must be in [0.0, 1.0], got {value!r}")
+    if not smoothness > similarity:
+        raise KeyError(
+            "smoothness must be greater than similarity, "
+            f"got smoothness={smoothness!r} similarity={similarity!r}"
+        )
+    return float(similarity), float(smoothness)
+
+
+def _validated_alpha(value: object) -> float:
+    """Validate a scalar coverage value in ``[0.0, 1.0]``."""
+    if not _is_finite(value):
+        raise KeyError(f"alpha must be a finite number, got {value!r}")
+    if value < 0.0 or value > 1.0:
+        raise KeyError(f"alpha must be in [0.0, 1.0], got {value!r}")
+    return float(value)
+
+
+
 def ycbcr(pixel: Pixel) -> tuple[float, float, float]:
     """Convert one normalized RGB pixel to BT.601 full-range YCbCr.
 
@@ -58,7 +118,11 @@ def ycbcr(pixel: Pixel) -> tuple[float, float, float]:
     A malformed pixel (wrong arity, non-finite component, or a component
     outside ``[0.0, 1.0]``) raises :class:`KeyError`.
     """
-    raise NotImplementedError
+    r, g, b = _components(pixel)
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = 0.5 + (b - y) / 1.772
+    cr = 0.5 + (r - y) / 1.402
+    return (y, cb, cr)
 
 
 def chroma_distance(pixel: Pixel, key: Pixel) -> float:
@@ -72,7 +136,9 @@ def chroma_distance(pixel: Pixel, key: Pixel) -> float:
 
     A malformed pixel or key raises :class:`KeyError`.
     """
-    raise NotImplementedError
+    _, pixel_cb, pixel_cr = ycbcr(_components(pixel))
+    _, key_cb, key_cr = ycbcr(_validated_key(key))
+    return math.hypot(pixel_cb - key_cb, pixel_cr - key_cr)
 
 
 def alpha_for(
@@ -99,7 +165,16 @@ def alpha_for(
     Malformed pixels, an invalid key (including an exactly black key), or
     invalid parameters raise :class:`KeyError` instead of dividing by zero.
     """
-    raise NotImplementedError
+    similarity, smoothness = _validated_params(similarity, smoothness)
+    key = _validated_key(key)
+    distance = chroma_distance(pixel, key)
+
+    if distance <= similarity:
+        return 0.0
+    if distance >= similarity + smoothness:
+        return 1.0
+    alpha = (distance - similarity) / smoothness
+    return min(1.0, max(0.0, alpha))
 
 
 def spill_suppress(pixel: Pixel, key: Pixel, amount: float) -> Pixel:
@@ -116,7 +191,17 @@ def spill_suppress(pixel: Pixel, key: Pixel, amount: float) -> Pixel:
     A malformed pixel, an invalid key (including black), or an out-of-range
     ``amount`` raises :class:`KeyError`.
     """
-    raise NotImplementedError
+    r, g, b = _components(pixel)
+    key = _validated_key(key)
+    if not _is_finite(amount):
+        raise KeyError(f"amount must be a finite number, got {amount!r}")
+    if amount < 0.0 or amount > 1.0:
+        raise KeyError(f"amount must be in [0.0, 1.0], got {amount!r}")
+
+    channels = [r, g, b]
+    dominant = key.index(max(key))
+    channels[dominant] *= 1.0 - amount
+    return (channels[0], channels[1], channels[2])
 
 
 def despill_edge(alpha: list[list[float]], radius: int) -> list[list[float]]:
@@ -136,7 +221,57 @@ def despill_edge(alpha: list[list[float]], radius: int) -> list[list[float]]:
     Ragged rows, non-finite or out-of-range samples, or a negative
     ``radius`` raise :class:`KeyError`.
     """
-    raise NotImplementedError
+    if isinstance(radius, bool) or not isinstance(radius, int):
+        raise KeyError(f"radius must be an integer, got {radius!r}")
+    if radius < 0:
+        raise KeyError(f"radius must be non-negative, got {radius!r}")
+    if not isinstance(alpha, (list, tuple)):
+        raise KeyError(f"alpha matte must be a list of rows, got {alpha!r}")
+
+    rows = len(alpha)
+    if rows == 0:
+        return []
+    if not isinstance(alpha[0], (list, tuple)):
+        raise KeyError(f"alpha row must be a list, got {alpha[0]!r}")
+    cols = len(alpha[0])
+    for row in alpha:
+        if not isinstance(row, (list, tuple)) or len(row) != cols:
+            raise KeyError("alpha matte must be rectangular")
+
+    samples: list[list[float]] = []
+    for row in alpha:
+        validated_row = []
+        for value in row:
+            if not _is_finite(value):
+                raise KeyError(f"alpha sample must be finite, got {value!r}")
+            if value < 0.0 or value > 1.0:
+                raise KeyError(f"alpha sample must be in [0.0, 1.0], got {value!r}")
+            validated_row.append(float(value))
+        samples.append(validated_row)
+
+    if radius == 0 or cols == 0:
+        return [row[:] for row in samples]
+
+    feathered: list[list[float]] = []
+    for y in range(rows):
+        out_row = []
+        for x in range(cols):
+            value = samples[y][x]
+            if value == 0.0 or value == 1.0:
+                out_row.append(value)
+                continue
+            y_lo, y_hi = max(0, y - radius), min(rows, y + radius + 1)
+            x_lo, x_hi = max(0, x - radius), min(cols, x + radius + 1)
+            total = 0.0
+            count = 0
+            for ny in range(y_lo, y_hi):
+                source_row = samples[ny]
+                for nx in range(x_lo, x_hi):
+                    total += source_row[nx]
+                    count += 1
+            out_row.append(total / count)
+        feathered.append(out_row)
+    return feathered
 
 
 def composite(fg: Pixel, bg: Pixel, alpha: float) -> tuple[float, float, float]:
@@ -155,7 +290,15 @@ def composite(fg: Pixel, bg: Pixel, alpha: float) -> tuple[float, float, float]:
 
     A malformed pixel or out-of-range alpha raises :class:`KeyError`.
     """
-    raise NotImplementedError
+    fg_r, fg_g, fg_b = _components(fg)
+    bg_r, bg_g, bg_b = _components(bg)
+    alpha = _validated_alpha(alpha)
+    inverse = 1.0 - alpha
+    return (
+        fg_r * alpha + bg_r * inverse,
+        fg_g * alpha + bg_g * inverse,
+        fg_b * alpha + bg_b * inverse,
+    )
 
 
 def validate_params(
@@ -182,7 +325,40 @@ def validate_params(
     full list is returned when several fields are wrong.  Values are checked
     at an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    problems: list[str] = []
+
+    key_ok = False
+    if not isinstance(key, (tuple, list)) or len(key) != 3:
+        problems.append(f"key must be a 3-component RGB triple, got {key!r}")
+    else:
+        key_ok = True
+        for index, component in enumerate(key):
+            if not _is_finite(component):
+                problems.append(f"key component {index} must be finite, got {component!r}")
+                key_ok = False
+            elif component < 0.0 or component > 1.0:
+                problems.append(
+                    f"key component {index} must be in [0.0, 1.0], got {component!r}"
+                )
+                key_ok = False
+        if key_ok and all(abs(component) <= _TOL for component in key):
+            problems.append("key must not be black: (0.0, 0.0, 0.0) would key out every black pixel")
+
+    similarity_ok = _is_finite(similarity) and 0.0 <= similarity <= 1.0
+    if not similarity_ok:
+        problems.append(f"similarity must be finite and in [0.0, 1.0], got {similarity!r}")
+
+    smoothness_ok = _is_finite(smoothness) and 0.0 <= smoothness <= 1.0
+    if not smoothness_ok:
+        problems.append(f"smoothness must be finite and in [0.0, 1.0], got {smoothness!r}")
+
+    if similarity_ok and smoothness_ok and not smoothness > similarity:
+        problems.append(
+            "smoothness must be greater than similarity, "
+            f"got smoothness={smoothness!r} similarity={similarity!r}"
+        )
+
+    return problems
 
 
 def key_batch(frames: list[Frame], config: dict) -> dict:
@@ -210,4 +386,52 @@ def key_batch(frames: list[Frame], config: dict) -> dict:
     frame raises :class:`KeyError`; no partial result is returned and the
     input frames are never mutated.
     """
-    raise NotImplementedError
+    if not isinstance(config, dict):
+        raise KeyError(f"config must be a mapping, got {config!r}")
+    for field in ("key", "similarity", "smoothness"):
+        if field not in config:
+            raise KeyError(f"config is missing {field!r}")
+
+    key = config["key"]
+    similarity = config["similarity"]
+    smoothness = config["smoothness"]
+    problems = validate_params(key, similarity, smoothness)
+    if problems:
+        raise KeyError("; ".join(problems))
+
+    # Validate every frame fully before building any result, so an invalid
+    # frame late in the batch cannot leave a partial result behind.
+    checked: list[list[list[tuple[float, float, float]]]] = []
+    if not isinstance(frames, (list, tuple)):
+        raise KeyError(f"frames must be a list, got {frames!r}")
+    for index, frame in enumerate(frames):
+        if not isinstance(frame, (list, tuple)):
+            raise KeyError(f"frame {index} must be a list of rows")
+        if len(frame) == 0:
+            checked.append([])
+            continue
+        if not isinstance(frame[0], (list, tuple)):
+            raise KeyError(f"frame {index} row must be a list")
+        width = len(frame[0])
+        validated_frame = []
+        for y, row in enumerate(frame):
+            if not isinstance(row, (list, tuple)) or len(row) != width:
+                raise KeyError(f"frame {index} must be rectangular")
+            validated_row = []
+            for x, pixel in enumerate(row):
+                try:
+                    validated_row.append(_components(pixel))
+                except KeyError as exc:
+                    raise KeyError(f"frame {index} pixel ({y}, {x}): {exc}") from exc
+            validated_frame.append(validated_row)
+        checked.append(validated_frame)
+
+    alpha_planes = []
+    for frame in checked:
+        plane = []
+        for row in frame:
+            # A fresh list per row and per frame: no shared or aliased buffers.
+            plane.append([alpha_for(pixel, key, similarity, smoothness) for pixel in row])
+        alpha_planes.append(plane)
+
+    return {"alpha": alpha_planes, "count": len(alpha_planes)}
